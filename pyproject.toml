@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "calyprium"
-version = "1.0.0"
+version = "1.0.1"
 description = "Calyprium CLI — autonomous web scraping from the command line"
 readme = "README.md"
 license = {text = "MIT"}

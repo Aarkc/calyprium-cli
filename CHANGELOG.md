@@ -1,3 +1,10 @@
+## [1.0.1](https://github.com/Aarkc/calyprium-cli/compare/v1.0.0...v1.0.1) (2026-03-29)
+
+
+### Bug Fixes
+
+* rename PyPI package from calyprium-cli to calyprium ([052cac3](https://github.com/Aarkc/calyprium-cli/commit/052cac3fcc987ee4b34b8558019ff094d3d5c3cf))
+
 # 1.0.0 (2026-03-29)
 
 
