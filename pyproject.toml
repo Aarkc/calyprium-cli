@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "calyprium-cli"
+version = "0.1.0"
+description = "Calyprium CLI — autonomous web scraping from the command line"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Calyprium", email = "hello@calyprium.com"}]
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.25",
+    "html2text>=2024.2",
+    "beautifulsoup4>=4.12",
+    "trafilatura>=2.0",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[project.scripts]
+calyprium = "calyprium:main"
+
+[project.urls]
+Homepage = "https://calyprium.com"
+Documentation = "https://docs.calyprium.com"
+Repository = "https://github.com/Aarkc/calyprium-cli"
+
+[tool.setuptools]
+py-modules = ["calyprium"]
