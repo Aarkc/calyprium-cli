@@ -182,15 +182,6 @@ ENVIRONMENTS = {
         "realm": "calyprium",
         "client_id": "calyprium-backend",
     },
-    "local": {
-        "agent_url": "http://localhost:10104",
-        "mimic_url": "http://localhost:10200",
-        "prism_url": "http://localhost:10300",
-        "forge_url": "http://localhost:10103",
-        "keycloak_url": "http://localhost:10001",
-        "realm": "calyprium",
-        "client_id": "calyprium-backend",
-    },
 }
 DEFAULT_ENV = "prod"
 
@@ -733,7 +724,7 @@ def cmd_fetch(args, cfg: dict):
             resp.raise_for_status()
         except httpx.ConnectError:
             _die(f"Cannot connect to Mimic at {mimic_url}\n"
-                 "  Make sure the service is running: docker compose up mimic")
+                 "  Check your MIMIC_URL or run `calyprium login` to authenticate.")
         except httpx.HTTPStatusError as e:
             try:
                 body = e.response.json()
@@ -935,7 +926,7 @@ def cmd_scrape(args, cfg: dict):
             thread = api_post(cfg, "/threads", {"metadata": {}})
     except httpx.ConnectError:
         _die(f"Cannot connect to agent at {cfg['agent_url']}\n"
-             "  Make sure services are running: docker compose --profile core up")
+             "  Check your connection settings or run `calyprium login` to authenticate.")
 
     thread_id = thread["thread_id"]
     _kv("thread", thread_id)
