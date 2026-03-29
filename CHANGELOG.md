@@ -1,3 +1,10 @@
+## [1.0.3](https://github.com/Aarkc/calyprium-cli/compare/v1.0.2...v1.0.3) (2026-03-29)
+
+
+### Bug Fixes
+
+* re-trigger PyPI publish ([483fbd2](https://github.com/Aarkc/calyprium-cli/commit/483fbd258066d20c30298b41aa5af46a51869480))
+
 ## [1.0.2](https://github.com/Aarkc/calyprium-cli/compare/v1.0.1...v1.0.2) (2026-03-29)
 
 
