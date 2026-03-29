@@ -1,3 +1,10 @@
+## [1.0.4](https://github.com/Aarkc/calyprium-cli/compare/v1.0.3...v1.0.4) (2026-03-29)
+
+
+### Bug Fixes
+
+* **ci:** use cycjimmy/semantic-release-action for proper step outputs ([2097d21](https://github.com/Aarkc/calyprium-cli/commit/2097d211e5ba494efae860a794fb59dd84dcc488))
+
 ## [1.0.3](https://github.com/Aarkc/calyprium-cli/compare/v1.0.2...v1.0.3) (2026-03-29)
 
 
