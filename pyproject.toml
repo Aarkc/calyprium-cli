@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "calyprium-cli"
+name = "calyprium"
 version = "1.0.0"
 description = "Calyprium CLI — autonomous web scraping from the command line"
 readme = "README.md"
