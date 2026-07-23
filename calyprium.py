@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sys
 import textwrap
 import threading
@@ -178,6 +179,7 @@ ENVIRONMENTS = {
         "mimic_url": "https://mimic.calyprium.com",
         "prism_url": "https://prism.calyprium.com",
         "forge_url": "https://forge.calyprium.com",
+        "vault_url": "https://vault.calyprium.com",
         "keycloak_url": "https://auth.calyprium.com",
         "realm": "calyprium",
         "client_id": "calyprium-backend",
@@ -225,6 +227,7 @@ def get_config(env: str = DEFAULT_ENV) -> dict:
         "mimic_url": os.getenv("MIMIC_URL", base["mimic_url"]).rstrip("/"),
         "prism_url": os.getenv("PRISM_URL", base["prism_url"]).rstrip("/"),
         "forge_url": os.getenv("FORGE_URL", base["forge_url"]).rstrip("/"),
+        "vault_url": os.getenv("VAULT_URL", base.get("vault_url", "https://vault.calyprium.com")).rstrip("/"),
         "keycloak_url": os.getenv("KEYCLOAK_URL", base["keycloak_url"]).rstrip("/"),
         "realm": os.getenv("KEYCLOAK_REALM", base["realm"]),
         "client_id": os.getenv("KEYCLOAK_CLIENT_ID", base["client_id"]),
@@ -2284,6 +2287,362 @@ def _download_data_file(forge: str, headers: dict, slug: str, files: list, outpu
     print(f"  {GREEN}Downloaded{RESET}: {out_path} ({size_str})")
 
 
+# ---------------------------------------------------------------------------
+# Dataset commands — unified datasets via Vault (one dataset, many spiders/sites)
+# ---------------------------------------------------------------------------
+
+
+def _vault_headers(cfg: dict) -> dict:
+    """Build auth headers for Vault API calls."""
+    token = get_token(cfg)
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _parse_kv_list(pairs, what):
+    """Parse a list of KEY=VALUE strings into a dict."""
+    out = {}
+    for item in pairs or []:
+        if "=" not in item:
+            print(f"  {RED}Error{RESET}: {what} must be KEY=VALUE, got: {item}", file=sys.stderr)
+            sys.exit(1)
+        k, _, v = item.partition("=")
+        out[k.strip()] = v.strip()
+    return out
+
+
+def _resolve_spider_user_id(cfg: dict, slug: str):
+    """Best-effort lookup of a spider's owner user_id from Forge."""
+    try:
+        resp = httpx.get(f"{cfg['forge_url']}/spiders", headers=_forge_headers(cfg), timeout=15)
+        if resp.status_code == 200:
+            for s in resp.json():
+                if s.get("slug") == slug:
+                    return s.get("user_id") or s.get("spider_user_id")
+    except Exception:
+        pass
+    return None
+
+
+def cmd_dataset(args, cfg: dict):
+    """Route to the appropriate dataset subcommand."""
+    dispatch = {
+        "list": cmd_dataset_list,
+        "create": cmd_dataset_create,
+        "add-spider": cmd_dataset_add_spider,
+        "spiders": cmd_dataset_spiders,
+        "query": cmd_dataset_query,
+    }
+    sub = getattr(args, "dataset_command", None)
+    if not sub or sub not in dispatch:
+        print("Usage: calyprium dataset {list|create|add-spider|spiders|query}", file=sys.stderr)
+        sys.exit(1)
+    dispatch[sub](args, cfg)
+
+
+def cmd_dataset_list(args, cfg: dict):
+    """List datasets (Vault dictionaries)."""
+    resp = httpx.get(f"{cfg['vault_url']}/api/dictionaries", headers=_vault_headers(cfg), timeout=15)
+    if resp.status_code != 200:
+        print(f"  {RED}Error{RESET}: {resp.status_code} {resp.text[:200]}", file=sys.stderr)
+        sys.exit(1)
+    dicts = resp.json()
+    if not dicts:
+        print("  No datasets yet. Create one: calyprium dataset create <id> --primary-key <field>")
+        return
+    print(f"\n  {'ID':<24s} {'Name':<28s} {'Type':<10s} {'Rows':>8s}")
+    print(f"  {'-'*23:<24s} {'-'*27:<28s} {'-'*9:<10s} {'-'*7:>8s}")
+    for d in dicts:
+        print(f"  {d.get('id','?'):<24s} {d.get('name','?'):<28s} {d.get('type','?'):<10s} {str(d.get('entry_count',0)):>8s}")
+    print()
+
+
+def cmd_dataset_create(args, cfg: dict):
+    """Create a new dataset (Vault dictionary)."""
+    fields = _parse_kv_list(
+        [f.replace(":", "=", 1) for f in (args.field or [])], "--field (name:type)"
+    )
+    # Schema maps field -> {type, description}. Ensure the primary key is present.
+    schema = {name: {"type": ftype, "description": ""} for name, ftype in fields.items()}
+    schema.setdefault(args.primary_key, {"type": "string", "description": "primary key"})
+
+    payload = {
+        "id": args.id,
+        "name": args.name or args.id.replace("_", " ").title(),
+        "schema": schema,
+        "primary_key": args.primary_key,
+        "type": args.type,
+    }
+    if args.description:
+        payload["description"] = args.description
+
+    resp = httpx.post(
+        f"{cfg['vault_url']}/api/dictionaries",
+        headers={**_vault_headers(cfg), "Content-Type": "application/json"},
+        json=payload, timeout=20,
+    )
+    if resp.status_code == 409:
+        print(f"  {RED}Error{RESET}: dataset '{args.id}' already exists", file=sys.stderr)
+        sys.exit(1)
+    if resp.status_code not in (200, 201):
+        print(f"  {RED}Error{RESET}: {resp.status_code} {resp.text[:300]}", file=sys.stderr)
+        sys.exit(1)
+    print(f"  {GREEN}Created dataset{RESET}: {BOLD}{args.id}{RESET}")
+    print(f"  Add a spider: calyprium dataset add-spider {args.id} <spider_slug>")
+
+
+def cmd_dataset_add_spider(args, cfg: dict):
+    """Map a spider (site) into a dataset, with optional field normalization."""
+    user_id = args.user_id or _resolve_spider_user_id(cfg, args.spider_slug)
+    if not user_id:
+        print(f"  {RED}Error{RESET}: could not resolve the spider's owner id. "
+              f"Pass --user-id (the SPIDER_USER_ID in its storage path).", file=sys.stderr)
+        sys.exit(1)
+
+    field_map = _parse_kv_list(args.map, "--map (raw=canonical)")
+    payload = {"spider_user_id": user_id, "spider_slug": args.spider_slug}
+    if args.source_label:
+        payload["source_label"] = args.source_label
+    if field_map:
+        payload["field_map"] = field_map
+    if args.bucket:
+        payload["minio_bucket"] = args.bucket
+    if args.path:
+        payload["minio_path_pattern"] = args.path
+
+    resp = httpx.post(
+        f"{cfg['vault_url']}/api/dictionaries/{args.dataset}/spiders",
+        headers={**_vault_headers(cfg), "Content-Type": "application/json"},
+        json=payload, timeout=20,
+    )
+    if resp.status_code == 404:
+        print(f"  {RED}Error{RESET}: dataset '{args.dataset}' not found", file=sys.stderr)
+        sys.exit(1)
+    if resp.status_code not in (200, 201):
+        print(f"  {RED}Error{RESET}: {resp.status_code} {resp.text[:300]}", file=sys.stderr)
+        sys.exit(1)
+    print(f"  {GREEN}Added{RESET} {BOLD}{args.spider_slug}{RESET} "
+          f"(source: {args.source_label or args.spider_slug}) to dataset {args.dataset}")
+    if field_map:
+        print(f"  Field mapping: {field_map}")
+
+
+def cmd_dataset_spiders(args, cfg: dict):
+    """List spiders (sites) mapped into a dataset."""
+    resp = httpx.get(
+        f"{cfg['vault_url']}/api/dictionaries/{args.dataset}/spiders",
+        headers=_vault_headers(cfg), timeout=15,
+    )
+    if resp.status_code == 404:
+        print(f"  {RED}Error{RESET}: dataset '{args.dataset}' not found", file=sys.stderr)
+        sys.exit(1)
+    if resp.status_code != 200:
+        print(f"  {RED}Error{RESET}: {resp.status_code} {resp.text[:200]}", file=sys.stderr)
+        sys.exit(1)
+    spiders = resp.json()
+    if not spiders:
+        print(f"  No spiders mapped to '{args.dataset}'")
+        return
+    print(f"\n  {'Source':<18s} {'Spider':<24s} {'Field map':<30s}")
+    print(f"  {'-'*17:<18s} {'-'*23:<24s} {'-'*29:<30s}")
+    for s in spiders:
+        fm = s.get("field_map") or {}
+        fm_str = ", ".join(f"{k}->{v}" for k, v in fm.items()) or "-"
+        src = s.get("source_label") or s.get("spider_slug", "?")
+        print(f"  {src:<18s} {s.get('spider_slug','?'):<24s} {fm_str:<30s}")
+    print()
+
+
+def cmd_dataset_query(args, cfg: dict):
+    """Run a SQL query across a dataset (use the dataset id as the table name)."""
+    sql = args.sql
+    # Convenience: if the user passed just a WHERE/columns fragment, wrap it.
+    if not re.search(r"\bfrom\b", sql, re.IGNORECASE):
+        sql = f"SELECT * FROM {args.dataset} WHERE {sql}" if sql.strip() else f"SELECT * FROM {args.dataset}"
+    resp = httpx.post(
+        f"{cfg['vault_url']}/api/query",
+        headers={**_vault_headers(cfg), "Content-Type": "application/json"},
+        json={"query": sql, "limit": args.limit},
+        timeout=60,
+    )
+    if resp.status_code != 200:
+        print(f"  {RED}Error{RESET}: {resp.status_code} {resp.text[:300]}", file=sys.stderr)
+        sys.exit(1)
+    result = resp.json()
+    if result.get("error"):
+        print(f"  {RED}Query error{RESET}: {result['error']}", file=sys.stderr)
+        sys.exit(1)
+    rows = result.get("rows", [])
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        print(f"  {GREEN}Wrote{RESET} {len(rows)} rows to {args.output}")
+        return
+    for r in rows:
+        print(json.dumps(r, default=str))
+    print(f"\n  {len(rows)} rows ({result.get('execution_time_ms', 0)} ms)", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# AI skills — bundled Claude Code agent skills, installed into ~/.claude/skills
+# ---------------------------------------------------------------------------
+
+# Only skill directories with this prefix are managed by the CLI; anything else
+# the user keeps under ~/.claude/skills is left untouched.
+SKILLS_PREFIX = "calyprium-"
+CLAUDE_SKILLS_DIR = Path.home() / ".claude" / "skills"
+SKILLS_MARKER = CLAUDE_SKILLS_DIR / ".calyprium-skills.json"
+
+
+def _bundled_skills_dir() -> Path | None:
+    """Locate the bundled skills directory (installed package or dev checkout)."""
+    try:
+        import calyprium_skills  # type: ignore
+
+        src = Path(calyprium_skills.__file__).resolve().parent / "skills"
+        if src.is_dir():
+            return src
+    except Exception:
+        pass
+    # Dev fallback: running straight from the repo without an install.
+    src = Path(__file__).resolve().parent / "calyprium_skills" / "skills"
+    return src if src.is_dir() else None
+
+
+def _managed_skill_dirs(src: Path) -> list[Path]:
+    """Skill directories we ship (each has a SKILL.md and the managed prefix)."""
+    return sorted(
+        d
+        for d in src.iterdir()
+        if d.is_dir()
+        and d.name.startswith(SKILLS_PREFIX)
+        and (d / "SKILL.md").is_file()
+    )
+
+
+def _skills_signature(src: Path) -> str:
+    """Content hash over all shipped skill files — changes whenever a skill does."""
+    h = hashlib.sha256()
+    for d in _managed_skill_dirs(src):
+        for f in sorted(d.rglob("*")):
+            if f.is_file():
+                h.update(f.relative_to(src).as_posix().encode())
+                h.update(b"\0")
+                h.update(f.read_bytes())
+                h.update(b"\0")
+    return h.hexdigest()
+
+
+def install_skills(force: bool = False) -> tuple[list[str], list[str]]:
+    """Copy bundled skills into ~/.claude/skills. Returns (written, skipped) names."""
+    src = _bundled_skills_dir()
+    if src is None:
+        return ([], [])
+    written: list[str] = []
+    skipped: list[str] = []
+    CLAUDE_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    for skill in _managed_skill_dirs(src):
+        dest = CLAUDE_SKILLS_DIR / skill.name
+        if dest.exists() and not force:
+            skipped.append(skill.name)
+            continue
+        if dest.exists():
+            shutil.rmtree(dest)
+        # Template .py files get byte-compiled by pip in site-packages; keep the
+        # installed skill clean of __pycache__/.pyc artifacts.
+        shutil.copytree(skill, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"))
+        written.append(skill.name)
+    return (written, skipped)
+
+
+def _maybe_auto_install_skills() -> None:
+    """Install/refresh bundled skills on CLI use. Silent unless something changes."""
+    if os.getenv("CALYPRIUM_NO_SKILLS"):
+        return
+    try:
+        src = _bundled_skills_dir()
+        if src is None:
+            return
+        signature = _skills_signature(src)
+        previous = None
+        if SKILLS_MARKER.is_file():
+            try:
+                previous = json.loads(SKILLS_MARKER.read_text()).get("signature")
+            except (json.JSONDecodeError, OSError):
+                previous = None
+        if previous == signature:
+            return  # up to date — fast path, nothing to do
+        first_time = previous is None
+        # Refresh our own skills on change; on first run only fill gaps so we
+        # never clobber a skill the user happens to have placed there already.
+        written, _ = install_skills(force=not first_time)
+        SKILLS_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        SKILLS_MARKER.write_text(
+            json.dumps({"signature": signature, "skills": [s.name for s in _managed_skill_dirs(src)]})
+        )
+        if written:
+            verb = "Installed" if first_time else "Updated"
+            print(
+                f"  {DIM}{verb} Calyprium AI skills ({', '.join(written)}) "
+                f"in {CLAUDE_SKILLS_DIR}{RESET}",
+                file=sys.stderr,
+            )
+    except Exception:
+        return  # never let skill installation break a real command
+
+
+def cmd_skills(args, cfg: dict):
+    """Manage the bundled Claude Code agent skills."""
+    action = getattr(args, "skills_command", None) or "status"
+    src = _bundled_skills_dir()
+
+    if action == "install":
+        if src is None:
+            print(f"  {RED}No bundled skills found{RESET}", file=sys.stderr)
+            sys.exit(1)
+        written, skipped = install_skills(force=args.force)
+        try:
+            SKILLS_MARKER.parent.mkdir(parents=True, exist_ok=True)
+            SKILLS_MARKER.write_text(
+                json.dumps({"signature": _skills_signature(src), "skills": [d.name for d in _managed_skill_dirs(src)]})
+            )
+        except OSError:
+            pass
+        if written:
+            print(f"  {GREEN}Installed{RESET} {', '.join(written)} -> {CLAUDE_SKILLS_DIR}")
+        if skipped:
+            hint = "" if args.force else " (use --force to overwrite)"
+            print(f"  {DIM}Skipped {', '.join(skipped)}{hint}{RESET}")
+        if not written and not skipped:
+            print(f"  {YELLOW}Nothing to install{RESET}")
+        return
+
+    if action == "uninstall":
+        removed = []
+        if CLAUDE_SKILLS_DIR.is_dir():
+            for d in sorted(CLAUDE_SKILLS_DIR.iterdir()):
+                if d.is_dir() and d.name.startswith(SKILLS_PREFIX) and (d / "SKILL.md").is_file():
+                    shutil.rmtree(d)
+                    removed.append(d.name)
+        SKILLS_MARKER.unlink(missing_ok=True)
+        if removed:
+            print(f"  {GREEN}Removed{RESET} {', '.join(removed)}")
+        else:
+            print(f"  {DIM}No Calyprium skills installed{RESET}")
+        return
+
+    # status (default)
+    bundled = _managed_skill_dirs(src) if src else []
+    print(f"  {BOLD}Bundled skills{RESET} ({len(bundled)}):")
+    for d in bundled:
+        installed = (CLAUDE_SKILLS_DIR / d.name).is_dir()
+        mark = f"{GREEN}installed{RESET}" if installed else f"{DIM}not installed{RESET}"
+        print(f"    {d.name}  [{mark}]")
+    print(f"\n  {DIM}Target: {CLAUDE_SKILLS_DIR}{RESET}")
+    print(f"  {DIM}Run `calyprium skills install` to (re)install, or set "
+          f"CALYPRIUM_NO_SKILLS=1 to disable auto-install.{RESET}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="calyprium",
@@ -2294,9 +2653,11 @@ def main():
               fetch <url>                Fetch a page and extract content
               scrape <url> <desc>        Autonomous spider pipeline
               spider <subcommand>        Deploy, run, and manage spiders
+              dataset <subcommand>       Unified datasets across many spiders/sites
               intel <subcommand>         Domain analysis, sitemaps, detection
               data                       List recent threads/runs
               chat [message]             Converse with the agent
+              skills <subcommand>        Manage bundled Claude Code AI skills
 
             spider subcommands:
               spider deploy <file>       Deploy a spider .py file to Forge
@@ -2305,6 +2666,13 @@ def main():
               spider logs <slug>         Show logs for a spider run
               spider results <slug>      Download scraped data
               spider list                List deployed spiders
+
+            dataset subcommands:
+              dataset create <id>        Create a dataset (--primary-key required)
+              dataset add-spider <ds> <spider>  Map a spider/site in (--map raw=canonical)
+              dataset spiders <ds>       List spiders/sites in a dataset
+              dataset query <ds> <sql>   Query across all sites in the dataset
+              dataset list               List datasets
 
             intel subcommands:
               intel analyze <domain>     Full analysis (overview + sitemap + detection + strategy)
@@ -2447,11 +2815,59 @@ def main():
     p_sp_results.add_argument("--preview", action="store_true", help="Preview a few items instead of downloading")
     p_sp_results.add_argument("--max-items", type=int, default=0, help="Max items to download (0 = all)")
 
+    # --- dataset ---
+    p_dataset = subparsers.add_parser("dataset", help="Unified datasets (many spiders/sites) via Vault")
+    dataset_sub = p_dataset.add_subparsers(dest="dataset_command")
+
+    dataset_sub.add_parser("list", help="List datasets")
+
+    p_ds_create = dataset_sub.add_parser("create", help="Create a dataset")
+    p_ds_create.add_argument("id", help="Dataset id (slug, e.g. electronics_parts)")
+    p_ds_create.add_argument("--primary-key", required=True, help="Primary key field (e.g. mpn)")
+    p_ds_create.add_argument("--name", default=None, help="Display name")
+    p_ds_create.add_argument("--field", action="append", metavar="NAME:TYPE",
+                             help="Canonical schema field (repeatable, e.g. --field price:number)")
+    p_ds_create.add_argument("--type", default="scraped", choices=["reference", "scraped", "external"],
+                             help="Dataset type (default: scraped)")
+    p_ds_create.add_argument("--description", default=None, help="Description")
+
+    p_ds_add = dataset_sub.add_parser("add-spider", help="Map a spider (site) into a dataset")
+    p_ds_add.add_argument("dataset", help="Dataset id")
+    p_ds_add.add_argument("spider_slug", help="Spider slug to add")
+    p_ds_add.add_argument("--user-id", default=None, help="Spider owner id (auto-resolved from Forge if omitted)")
+    p_ds_add.add_argument("--source-label", default=None, help="Label for the _source column (default: slug)")
+    p_ds_add.add_argument("--map", action="append", metavar="RAW=CANONICAL",
+                          help="Normalize a field name (repeatable, e.g. --map part_no=mpn)")
+    p_ds_add.add_argument("--bucket", default=None, help="Override MinIO bucket (default: platform data bucket)")
+    p_ds_add.add_argument("--path", default=None, help="Override path glob (default: {user}/{slug}/**/*.jl)")
+
+    p_ds_spiders = dataset_sub.add_parser("spiders", help="List spiders mapped into a dataset")
+    p_ds_spiders.add_argument("dataset", help="Dataset id")
+
+    p_ds_query = dataset_sub.add_parser("query", help="Query across a dataset (SQL; dataset id = table name)")
+    p_ds_query.add_argument("dataset", help="Dataset id")
+    p_ds_query.add_argument("sql", help="SQL query, or a WHERE fragment (dataset id is the table)")
+    p_ds_query.add_argument("--limit", "-n", type=int, default=100, help="Max rows (default: 100)")
+    p_ds_query.add_argument("-o", "--output", default=None, help="Write JSONL to file instead of stdout")
+
+    # --- skills ---
+    p_skills = subparsers.add_parser("skills", help="Manage bundled Claude Code AI skills")
+    skills_sub = p_skills.add_subparsers(dest="skills_command")
+    p_sk_install = skills_sub.add_parser("install", help="Install skills into ~/.claude/skills")
+    p_sk_install.add_argument("--force", action="store_true", help="Overwrite existing skills")
+    skills_sub.add_parser("uninstall", help="Remove Calyprium skills from ~/.claude/skills")
+    skills_sub.add_parser("status", help="Show bundled vs installed skills")
+
     # --- login / logout ---
     subparsers.add_parser("login", help="Sign in via browser (Keycloak PKCE)")
     subparsers.add_parser("logout", help="Remove stored credentials")
 
     args = parser.parse_args()
+
+    # Make the AI skills available in Claude Code as soon as the CLI is used.
+    if args.command != "skills":
+        _maybe_auto_install_skills()
+
     cfg = get_config(args.env)
     cfg["_env_name"] = args.env
 
@@ -2462,6 +2878,8 @@ def main():
         "chat": cmd_chat,
         "intel": cmd_intel,
         "spider": cmd_spider,
+        "dataset": cmd_dataset,
+        "skills": cmd_skills,
         "login": cmd_login,
         "logout": cmd_logout,
     }
