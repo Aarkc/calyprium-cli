@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/Aarkc/calyprium-cli/compare/v1.0.4...v1.1.0) (2026-07-23)
+
+
+### Features
+
+* **cli:** install bundled AI skills on first run ([#1](https://github.com/Aarkc/calyprium-cli/issues/1)) ([8aeffec](https://github.com/Aarkc/calyprium-cli/commit/8aeffec14cd426a19b643dea3fa56e7d1dbe9f30))
+
 ## [1.0.4](https://github.com/Aarkc/calyprium-cli/compare/v1.0.3...v1.0.4) (2026-03-29)
 
 
