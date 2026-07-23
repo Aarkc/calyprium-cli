@@ -30,3 +30,7 @@ Repository = "https://github.com/Aarkc/calyprium-cli"
 
 [tool.setuptools]
 py-modules = ["calyprium"]
+packages = ["calyprium_skills"]
+
+[tool.setuptools.package-data]
+calyprium_skills = ["skills/**/*"]
